@@ -1,6 +1,48 @@
 import json
+import logging
+import time
 import httpx
 from app.config import settings
+
+logger = logging.getLogger("ai.claude")
+
+# 모델별 $/1M 토큰 단가 (input, output). 확인된 모델만 등록 — 없는 모델은 cost_usd=None으로 로깅.
+_PRICING_USD_PER_1M: dict[str, tuple[float, float]] = {
+    "claude-haiku-4-5-20251001": (1.00, 5.00),
+    # "claude-opus-4-5-20251101": 레거시 모델, 공식 단가 확인 후 채울 것
+}
+
+
+def _log_claude_call(
+    *,
+    kind: str,
+    model: str,
+    latency_ms: float,
+    usage: dict | None,
+    error: str | None = None,
+) -> None:
+    """Claude 호출 1건의 latency/토큰/비용을 구조화 로그로 남긴다."""
+    input_tokens = (usage or {}).get("input_tokens", 0)
+    output_tokens = (usage or {}).get("output_tokens", 0)
+
+    pricing = _PRICING_USD_PER_1M.get(model)
+    cost_usd = None
+    if pricing and usage is not None:
+        cost_usd = round(
+            input_tokens / 1_000_000 * pricing[0] + output_tokens / 1_000_000 * pricing[1],
+            6,
+        )
+
+    logger.info(json.dumps({
+        "event": "claude_call",
+        "kind": kind,  # "text" | "vision"
+        "model": model,
+        "latency_ms": round(latency_ms, 1),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": cost_usd,
+        "error": error,
+    }, ensure_ascii=False))
 
 
 async def call_claude(prompt: str, model: str | None = None, max_tokens: int = 1000) -> str:
@@ -34,11 +76,25 @@ async def _call_gms(prompt: str, model: str, max_tokens: int) -> str:
         "messages": [{"role": "user", "content": prompt}],
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
+    start = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+    except Exception as e:
+        _log_claude_call(
+            kind="text", model=model,
+            latency_ms=(time.monotonic() - start) * 1000,
+            usage=None, error=f"{type(e).__name__}: {e}",
+        )
+        raise
 
     data = response.json()
+    _log_claude_call(
+        kind="text", model=model,
+        latency_ms=(time.monotonic() - start) * 1000,
+        usage=data.get("usage"),
+    )
     return data["content"][0]["text"]
 
 
@@ -170,11 +226,25 @@ async def _call_gms_vision(
         }],
     }
 
-    async with httpx.AsyncClient(timeout=25) as client:
-        response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
+    start = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+    except Exception as e:
+        _log_claude_call(
+            kind="vision", model=model,
+            latency_ms=(time.monotonic() - start) * 1000,
+            usage=None, error=f"{type(e).__name__}: {e}",
+        )
+        raise
 
     data = response.json()
+    _log_claude_call(
+        kind="vision", model=model,
+        latency_ms=(time.monotonic() - start) * 1000,
+        usage=data.get("usage"),
+    )
     return data["content"][0]["text"]
 
 
