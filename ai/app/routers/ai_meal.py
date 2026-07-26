@@ -6,7 +6,7 @@ from app.schemas.meal import (
     DietAnalyzeRequest, DietAnalyzeResponse,
     PhotoAnalyzeRequest, DetectedItem, PhotoAnalyzeResponse,
 )
-from app.services.claude_service import call_claude, call_claude_vision
+from app.services.claude_service import call_claude, call_claude_vision, strip_json_code_block
 from app.services.diet_service import calculate_diet_analysis
 
 router = APIRouter(prefix="/ai/meal", tags=["AI Meal"])
@@ -72,15 +72,7 @@ JSON 배열 형식으로만 응답하세요:
 
     try:
         raw = await call_claude(prompt)
-
-        # ```json 블록 또는 순수 배열 모두 처리
-        cleaned = raw.strip()
-        if "```" in cleaned:
-            parts = cleaned.split("```")
-            cleaned = parts[1] if len(parts) > 1 else cleaned
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:]
-
+        cleaned = strip_json_code_block(raw)
         meals = json.loads(cleaned)
         recommendations = [MealRecommendation(**m) for m in meals]
     except Exception as e:
@@ -168,12 +160,7 @@ async def analyze_photo(req: PhotoAnalyzeRequest):
             prompt=prompt,
             max_tokens=800,
         )
-        cleaned = raw.strip()
-        if "```" in cleaned:
-            parts = cleaned.split("```")
-            cleaned = parts[1] if len(parts) > 1 else cleaned
-            if cleaned.lower().startswith("json"):
-                cleaned = cleaned[4:]
+        cleaned = strip_json_code_block(raw)
         data = json.loads(cleaned)
         items = [DetectedItem(**item) for item in data.get("detected_items", [])]
         total_kcal = sum(i.kcal for i in items)

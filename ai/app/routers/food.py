@@ -3,7 +3,7 @@ import json
 from fastapi import APIRouter, Query
 from app.schemas.food import FoodItem, FoodSearchResponse
 from app.services.mfds_service import search_food_mfds
-from app.services.claude_service import call_claude
+from app.services.claude_service import call_claude, strip_json_code_block
 
 router = APIRouter(prefix="/food", tags=["Food"])
 
@@ -44,14 +44,7 @@ JSON 배열 형식으로만 응답:
 """
     try:
         raw = await call_claude(prompt)
-
-        cleaned = raw.strip()
-        if "```" in cleaned:
-            parts = cleaned.split("```")
-            cleaned = parts[1] if len(parts) > 1 else cleaned
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:]
-
+        cleaned = strip_json_code_block(raw)
         meals = json.loads(cleaned)
         return [
             FoodItem(
