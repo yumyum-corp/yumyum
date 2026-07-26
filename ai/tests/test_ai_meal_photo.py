@@ -43,11 +43,45 @@ def test_total_kcal_아이템_합산과_일치():
     assert abs(data["total_kcal"] - items_sum) < 1.0
 
 
-def test_빈_base64는_mock_모드에서도_정상_처리():
-    """dev 환경에서는 base64 값과 무관하게 mock 응답 반환"""
+def test_빈_base64는_400_반환():
     response = client.post("/ai/meal/analyze-photo", json={
         "image_base64": "",
         "media_type": "image/jpeg",
         "meal_type": "BREAKFAST",
     })
-    assert response.status_code == 200
+    assert response.status_code == 400
+
+
+def test_지원하지_않는_media_type은_400_반환():
+    response = client.post("/ai/meal/analyze-photo", json={
+        "image_base64": "dGVzdA==",
+        "media_type": "image/gif",
+        "meal_type": "BREAKFAST",
+    })
+    assert response.status_code == 400
+
+
+def test_너무_큰_base64는_400_반환():
+    oversized = "a" * 8_000_001
+    response = client.post("/ai/meal/analyze-photo", json={
+        "image_base64": oversized,
+        "media_type": "image/jpeg",
+        "meal_type": "BREAKFAST",
+    })
+    assert response.status_code == 400
+
+
+def test_vision_호출_실패시_기술적_오류_메시지_반환(monkeypatch):
+    """call_claude_vision이 예외를 던지면 '음식 미감지'가 아닌 오류 메시지를 반환해야 한다."""
+    from app.routers import ai_meal
+
+    async def failing_call_claude_vision(**kwargs):
+        raise RuntimeError("GMS 타임아웃")
+
+    monkeypatch.setattr(ai_meal, "call_claude_vision", failing_call_claude_vision)
+
+    response = client.post("/ai/meal/analyze-photo", json=VALID_REQUEST)
+    data = response.json()
+    assert data["detected_items"] == []
+    assert "오류" in data["ai_comment"]
+    assert "인식하지 못했" not in data["ai_comment"]
