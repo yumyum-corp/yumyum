@@ -1,12 +1,17 @@
 import os
 os.environ.setdefault("ENV", "dev")
 
+import asyncio
+import time
+
 import pytest
+from app.config import settings
 from app.schemas.coaching import (
     WeeklyCoachingRequest, DailyNutritionRecord,
     RoutineSessionRecord, WeightRecord,
 )
-from app.services.coaching_service import _calc_stats, run_coaching_chain
+from app.services import coaching_service
+from app.services.coaching_service import _calc_stats, _exercise_agent, run_coaching_chain
 
 
 # ── 공통 픽스처 ────────────────────────────────────────────────────────
@@ -90,11 +95,40 @@ async def test_routine_sessions_없어도_정상_처리():
 
 
 @pytest.mark.asyncio
-async def test_nutrition_summary_가_exercise_summary에_전달됨():
-    """dev mock에서 각 summary가 [MOCK] 텍스트임을 확인 — 체인이 실제로 순차 실행됨."""
+async def test_체인_전체_summary가_MOCK_텍스트():
     req = _make_request()
     result = await run_coaching_chain(req)
     assert result.nutrition_summary.startswith("[MOCK]")
     assert result.exercise_summary.startswith("[MOCK]")
     assert result.goal_summary.startswith("[MOCK]")
     assert result.ai_comment.startswith("[MOCK]")
+
+
+# ── Multi-Agent 병렬화 ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_exercise_agent는_nutrition_analysis_없이_호출_가능():
+    """nutrition_agent와 exercise_agent는 강한 의존관계가 없어 병렬 실행되므로
+    exercise_agent가 nutrition_analysis를 인자로 받지 않아야 한다."""
+    req = _make_request()
+    result = await _exercise_agent(req)
+    assert result
+
+
+@pytest.mark.asyncio
+async def test_nutrition_exercise_agent는_병렬로_실행된다(monkeypatch):
+    monkeypatch.setattr(settings, "env", "prod")
+
+    async def slow_call_claude(prompt, max_tokens=1000, model=None):
+        await asyncio.sleep(0.1)
+        return "[STUB] " + prompt[:10]
+
+    monkeypatch.setattr(coaching_service, "call_claude", slow_call_claude)
+
+    req = _make_request()
+    start = time.monotonic()
+    await run_coaching_chain(req)
+    elapsed = time.monotonic() - start
+
+    # 4개 에이전트 순차 실행이면 ~0.4s, nutrition/exercise 병렬화 시 ~0.3s
+    assert elapsed < 0.35
