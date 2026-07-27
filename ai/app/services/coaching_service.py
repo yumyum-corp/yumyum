@@ -1,3 +1,4 @@
+import asyncio
 from typing import Optional
 from app.config import settings
 from app.services.claude_service import call_claude
@@ -45,7 +46,7 @@ async def _nutrition_agent(req: WeeklyCoachingRequest, avg_calorie_rate: float) 
         return "영양 분석 불가"
 
 
-async def _exercise_agent(req: WeeklyCoachingRequest, nutrition_analysis: str) -> str:
+async def _exercise_agent(req: WeeklyCoachingRequest) -> str:
     if settings.env == "dev":
         return "[MOCK] 세션 성공률 양호, 단백질 보충 권장합니다."
 
@@ -59,9 +60,7 @@ async def _exercise_agent(req: WeeklyCoachingRequest, nutrition_analysis: str) -
     prompt = (
         f"[운동 분석] 건강 목표: {req.health_goal}\n"
         f"세션 기록:\n{session_summary}\n"
-        f"영양 분석 참고: {nutrition_analysis}\n"
-        "위 데이터를 바탕으로 이번 주 운동 성과를 2문장으로 분석하세요. "
-        "영양 분석과 연관 지점이 있으면 언급하세요."
+        "위 데이터를 바탕으로 이번 주 운동 성과를 2문장으로 분석하세요."
     )
     try:
         return await call_claude(prompt, max_tokens=200)
@@ -126,8 +125,10 @@ async def run_coaching_chain(req: WeeklyCoachingRequest) -> WeeklyCoachingRespon
     except Exception:
         weight_trend = None
 
-    nutrition_analysis = await _nutrition_agent(req, avg_calorie_rate)
-    exercise_analysis = await _exercise_agent(req, nutrition_analysis)
+    nutrition_analysis, exercise_analysis = await asyncio.gather(
+        _nutrition_agent(req, avg_calorie_rate),
+        _exercise_agent(req),
+    )
     goal_analysis = await _goal_agent(req, weight_trend, nutrition_analysis, exercise_analysis)
     ai_comment = await _synthesis_agent(
         req.health_goal, nutrition_analysis, exercise_analysis, goal_analysis

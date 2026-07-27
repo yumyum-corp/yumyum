@@ -6,10 +6,13 @@ from app.schemas.meal import (
     DietAnalyzeRequest, DietAnalyzeResponse,
     PhotoAnalyzeRequest, DetectedItem, PhotoAnalyzeResponse,
 )
-from app.services.claude_service import call_claude, call_claude_vision
+from app.services.claude_service import call_claude, call_claude_vision, strip_json_code_block
 from app.services.diet_service import calculate_diet_analysis
 
 router = APIRouter(prefix="/ai/meal", tags=["AI Meal"])
+
+_ALLOWED_MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp"}
+_MAX_IMAGE_BASE64_CHARS = 8_000_000  # 약 6MB 원본 이미지 상당 (비용·지연 방지)
 
 
 @router.post("/last-recommend", response_model=LastRecommendResponse)
@@ -69,15 +72,7 @@ JSON 배열 형식으로만 응답하세요:
 
     try:
         raw = await call_claude(prompt)
-
-        # ```json 블록 또는 순수 배열 모두 처리
-        cleaned = raw.strip()
-        if "```" in cleaned:
-            parts = cleaned.split("```")
-            cleaned = parts[1] if len(parts) > 1 else cleaned
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:]
-
+        cleaned = strip_json_code_block(raw)
         meals = json.loads(cleaned)
         recommendations = [MealRecommendation(**m) for m in meals]
     except Exception as e:
@@ -142,6 +137,13 @@ async def analyze_photo(req: PhotoAnalyzeRequest):
     이미지 base64를 받아 Claude Vision으로 음식 감지 + 영양소 추정.
     Spring이 multipart → base64 변환 후 호출.
     """
+    if not req.image_base64:
+        raise HTTPException(status_code=400, detail="이미지 데이터가 없습니다.")
+    if req.media_type not in _ALLOWED_MEDIA_TYPES:
+        raise HTTPException(status_code=400, detail=f"지원하지 않는 이미지 형식입니다: {req.media_type}")
+    if len(req.image_base64) > _MAX_IMAGE_BASE64_CHARS:
+        raise HTTPException(status_code=400, detail="이미지 크기가 너무 큽니다.")
+
     prompt = (
         f"이 사진에 있는 음식을 모두 감지하고 영양소를 추정해주세요. 식사 유형: {req.meal_type}\n\n"
         "아래 JSON 형식으로만 응답하세요 (다른 텍스트 없이):\n"
@@ -158,21 +160,19 @@ async def analyze_photo(req: PhotoAnalyzeRequest):
             prompt=prompt,
             max_tokens=800,
         )
-        cleaned = raw.strip()
-        if "```" in cleaned:
-            parts = cleaned.split("```")
-            cleaned = parts[1] if len(parts) > 1 else cleaned
-            if cleaned.lower().startswith("json"):
-                cleaned = cleaned[4:]
+        cleaned = strip_json_code_block(raw)
         data = json.loads(cleaned)
         items = [DetectedItem(**item) for item in data.get("detected_items", [])]
         total_kcal = sum(i.kcal for i in items)
-        ai_comment = data.get("ai_comment", "")
+        ai_comment = data.get("ai_comment") or (
+            "사진에서 음식을 감지하지 못했어요. 다른 각도로 다시 촬영해보세요." if not items else ""
+        )
     except Exception as e:
+        # 파싱/호출 실패(기술적 오류) — "음식 미감지"와는 다른 메시지로 구분
         print(f"[analyze_photo] vision 분석 실패 — {type(e).__name__}: {e}")
         items = []
         total_kcal = 0.0
-        ai_comment = "음식을 인식하지 못했어요. 다시 촬영해보세요."
+        ai_comment = "사진 분석 중 오류가 발생했어요. 잠시 후 다시 시도해주세요."
 
     return PhotoAnalyzeResponse(
         detected_items=items,

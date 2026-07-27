@@ -82,3 +82,7 @@ pnpm-debug.log*
 ### Dev log (local only) ###
 docs/DEVLOG.md
 frontend/pr-body.md
+
+### Personal career-prep notes (local only) ###
+docs/jd-upgrade-roadmap.md
+docs/jd/

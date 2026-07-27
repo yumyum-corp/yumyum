@@ -11,6 +11,10 @@ _KB_PATH = Path(__file__).parent.parent / "data" / "nutrition_kb.json"
 _CHROMA_PATH = str(Path(__file__).parent.parent.parent / "chroma_db")
 _MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 
+# ChromaDB 기본 거리(L2, 낮을수록 유사)가 이 값을 초과하면 컨텍스트에서 제외.
+# 초기값은 경험적 추정치 — 우선순위1 retrieval 품질 평가 스크립트로 추후 튜닝 필요.
+_RELEVANCE_DISTANCE_THRESHOLD = 1.5
+
 
 def _get_collection():
     global _collection
@@ -53,13 +57,15 @@ def search(query: str, n_results: int = 3) -> list[dict]:
     results = collection.query(
         query_texts=[query],
         n_results=min(n_results, count),
-        include=["documents", "metadatas"],
+        include=["documents", "metadatas", "distances"],
     )
     docs = results["documents"][0]
     metas = results["metadatas"][0]
+    distances = results["distances"][0]
     return [
         {"name": m["name"], "info": m["info"], "document": d}
-        for d, m in zip(docs, metas)
+        for d, m, dist in zip(docs, metas, distances)
+        if dist <= _RELEVANCE_DISTANCE_THRESHOLD
     ]
 
 

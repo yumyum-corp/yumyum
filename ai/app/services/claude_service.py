@@ -45,6 +45,17 @@ def _log_claude_call(
     }, ensure_ascii=False))
 
 
+def strip_json_code_block(raw: str) -> str:
+    """Claude 응답에서 ```json ... ``` 코드블록 마커를 제거하고 JSON 본문만 반환한다."""
+    cleaned = raw.strip()
+    if "```" in cleaned:
+        parts = cleaned.split("```")
+        cleaned = parts[1] if len(parts) > 1 else cleaned
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+    return cleaned
+
+
 async def call_claude(prompt: str, model: str | None = None, max_tokens: int = 1000) -> str:
     """
     GMS API를 통해 Claude 호출.
