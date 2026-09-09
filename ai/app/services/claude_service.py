@@ -20,6 +20,7 @@ def _log_claude_call(
     latency_ms: float,
     usage: dict | None,
     error: str | None = None,
+    log_context: dict[str, str] | None = None,
 ) -> None:
     """Claude 호출 1건의 latency/토큰/비용을 구조화 로그로 남긴다."""
     input_tokens = (usage or {}).get("input_tokens", 0)
@@ -33,7 +34,7 @@ def _log_claude_call(
             6,
         )
 
-    logger.info(json.dumps({
+    payload = {
         "event": "claude_call",
         "kind": kind,  # "text" | "vision"
         "model": model,
@@ -42,7 +43,14 @@ def _log_claude_call(
         "output_tokens": output_tokens,
         "cost_usd": cost_usd,
         "error": error,
-    }, ensure_ascii=False))
+    }
+    if log_context:
+        payload.update({
+            key: log_context[key]
+            for key in ("coaching_run_id", "operation")
+            if key in log_context
+        })
+    logger.info(json.dumps(payload, ensure_ascii=False))
 
 
 def strip_json_code_block(raw: str) -> str:
@@ -56,7 +64,12 @@ def strip_json_code_block(raw: str) -> str:
     return cleaned
 
 
-async def call_claude(prompt: str, model: str | None = None, max_tokens: int = 1000) -> str:
+async def call_claude(
+    prompt: str,
+    model: str | None = None,
+    max_tokens: int = 1000,
+    log_context: dict[str, str] | None = None,
+) -> str:
     """
     GMS API를 통해 Claude 호출.
     dev 환경에서는 mock 응답 반환 (크레딧 절약).
@@ -64,10 +77,20 @@ async def call_claude(prompt: str, model: str | None = None, max_tokens: int = 1
     if settings.env == "dev":
         return _mock_response(prompt)
 
-    return await _call_gms(prompt, model=model or settings.default_model, max_tokens=max_tokens)
+    return await _call_gms(
+        prompt,
+        model=model or settings.default_model,
+        max_tokens=max_tokens,
+        log_context=log_context,
+    )
 
 
-async def _call_gms(prompt: str, model: str, max_tokens: int) -> str:
+async def _call_gms(
+    prompt: str,
+    model: str,
+    max_tokens: int,
+    log_context: dict[str, str] | None = None,
+) -> str:
     """
     GMS(Gen AI Management System) API 호출.
     curl 형식:
@@ -97,6 +120,7 @@ async def _call_gms(prompt: str, model: str, max_tokens: int) -> str:
             kind="text", model=model,
             latency_ms=(time.monotonic() - start) * 1000,
             usage=None, error=f"{type(e).__name__}: {e}",
+            log_context=log_context,
         )
         raise
 
@@ -105,6 +129,7 @@ async def _call_gms(prompt: str, model: str, max_tokens: int) -> str:
         kind="text", model=model,
         latency_ms=(time.monotonic() - start) * 1000,
         usage=data.get("usage"),
+        log_context=log_context,
     )
     return data["content"][0]["text"]
 

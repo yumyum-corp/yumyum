@@ -9,7 +9,7 @@ router = APIRouter(tags=["AI Coaching"])
 async def weekly_coaching(req: WeeklyCoachingRequest):
     """
     F704 - Multi-Agent 주간 코칭
-    영양→운동→목표 순차 체인 후 Synthesis로 통합 코칭 반환.
+    기록 상태에 따라 영양·운동·목표 Agent를 선택하고 Synthesis로 통합 코칭 반환.
     Spring @Scheduled 배치에서 호출되며, 결과는 WeeklyReport에 저장된다.
     """
     return await run_coaching_chain(req)
