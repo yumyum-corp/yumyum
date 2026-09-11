@@ -137,10 +137,20 @@ class Sample:
     kind: str
     items: list[GtItem]
     note: str = ""
+    # 항목별 정답이 없고 사진 전체 합계만 아는 샘플. 반찬칸이 나뉜 도시락은
+    # 포장이 총 내용량·총 열량만 주므로 항목별 그램을 알 방법이 없다.
+    # 이런 샘플은 항목 지표(F1·그램·kcal·밀도·Option A)에서 전부 빠지고
+    # 사진 합계 kcal 지표에만 기여한다 — 앱이 사용자에게 보여주는 숫자가
+    # 총 칼로리라 버리기엔 아깝다.
+    total_only: bool = False
+    total_kcal_gt: float | None = None
+    total_grams_gt: float | None = None
 
     @property
     def total_kcal(self) -> float | None:
-        """모든 아이템에 정답 kcal이 있을 때만 합계를 낸다."""
+        """total_only면 명시된 합계를, 아니면 아이템 합으로 낸다."""
+        if self.total_only:
+            return self.total_kcal_gt
         if not self.items or any(i.kcal is None for i in self.items):
             return None
         return sum(i.kcal for i in self.items)  # type: ignore[misc]
@@ -167,8 +177,14 @@ def load_dataset(path: Path) -> list[Sample]:
         if image.suffix.lower() not in _MEDIA_TYPES:
             raise SystemExit(f"{path}:{lineno} 지원하지 않는 확장자 — {image.name}")
 
+        total_only = bool(d.get("total_only", False))
+        if total_only and d.get("total_kcal") is None:
+            raise SystemExit(
+                f"{path}:{lineno} total_only 샘플에는 total_kcal이 필요하다."
+            )
+
         items = []
-        for i in d["items"]:
+        for i in d.get("items", []):
             src = i.get("kcal_source")
             if src is not None and src not in KCAL_SOURCES:
                 raise SystemExit(
@@ -190,6 +206,9 @@ def load_dataset(path: Path) -> list[Sample]:
                     aliases=list(i.get("aliases", [])),
                 )
             )
+        if not total_only and not items:
+            raise SystemExit(f"{path}:{lineno} items가 비었다 (total_only도 아니다).")
+
         samples.append(
             Sample(
                 id=str(d["id"]),
@@ -198,6 +217,15 @@ def load_dataset(path: Path) -> list[Sample]:
                 kind=d.get("kind", "single"),
                 items=items,
                 note=d.get("note", ""),
+                total_only=total_only,
+                total_kcal_gt=(
+                    float(d["total_kcal"]) if d.get("total_kcal") is not None else None
+                ),
+                total_grams_gt=(
+                    float(d["total_grams"])
+                    if d.get("total_grams") is not None
+                    else None
+                ),
             )
         )
 
@@ -298,7 +326,13 @@ _ARMS = ("pred", "oracle")
 _RULES = ("median", "oracle")
 
 _MFDS_PAGE_SIZE = 100
-_MFDS_MAX_PAGES = 5
+# MFDS 부분검색은 관련도순이 아니고 원물 단품이 뒤쪽 블록에 몰려 있다.
+# "닭가슴살"(총 3911건)·"우유"(2709건)·"아몬드"(2243건)의 정확일치가 모두
+# 17페이지에서 처음 나왔다. 상한이 낮으면 DB에 있는 것을 없다고 기록하게 된다.
+_MFDS_MAX_PAGES = 40
+# 정확일치를 찾은 뒤 이만큼 더 봐도 새 게 없으면 멈춘다. 일치 항목이
+# 한 블록에 뭉쳐 있어서, 앞에서 찾은 경우 뒤를 다 훑을 필요가 없다.
+_MFDS_QUIET_PAGES = 5
 
 
 async def mfds_lookup(query: str) -> dict[str, Any]:
@@ -320,6 +354,7 @@ async def mfds_lookup(query: str) -> dict[str, Any]:
 
     densities: list[float] = []
     names: list[str] = []
+    quiet = 0
     for page in range(1, _MFDS_MAX_PAGES + 1):
         try:
             items, total = await search_food_mfds(
@@ -329,6 +364,8 @@ async def mfds_lookup(query: str) -> dict[str, Any]:
             break
         if not items:
             break
+
+        found_here = False
         for it in items:
             if normalize(it.name) != key:
                 continue
@@ -336,7 +373,12 @@ async def mfds_lookup(query: str) -> dict[str, Any]:
             if d:
                 densities.append(d)
                 names.append(it.name)
+                found_here = True
+
         if page * _MFDS_PAGE_SIZE >= total:
+            break
+        quiet = 0 if found_here else quiet + 1
+        if densities and quiet >= _MFDS_QUIET_PAGES:
             break
 
     out = {"densities": densities, "names": names}
@@ -424,6 +466,9 @@ async def analyze(
 
 
 def score_sample(sample: Sample, preds: list[dict]) -> dict[str, Any]:
+    if sample.total_only:
+        return _score_total_only(sample, preds)
+
     matched = assign(sample.items, preds)
 
     grams_apes: list[float] = []
@@ -505,6 +550,34 @@ def score_sample(sample: Sample, preds: list[dict]) -> dict[str, Any]:
     }
 
 
+def _score_total_only(sample: Sample, preds: list[dict]) -> dict[str, Any]:
+    """항목 지표는 전부 비우고 사진 합계 kcal만 채점한다.
+
+    tp/fp/fn을 0으로 두는 게 핵심이다. 항목별 정답이 없는데 예측을 과검출로
+    세면 precision이 부당하게 떨어진다 — 모델이 반찬을 제대로 감지한 것을
+    라벨이 거칠다는 이유로 벌주게 된다.
+    """
+    gt_total = sample.total_kcal
+    total_ape = (
+        ape(sum(_num(p.get("kcal")) for p in preds), gt_total)
+        if gt_total is not None
+        else None
+    )
+    return {
+        "id": sample.id,
+        "kind": sample.kind,
+        "total_only": True,
+        "tp": 0, "exact": 0, "fp": 0, "fn": 0,
+        "grams_apes": [], "kcal_apes": [], "density_apes": [],
+        "total_kcal_ape": None if total_ape is None else round(total_ape, 2),
+        "gt_total_kcal": gt_total,
+        "pred_total_kcal": round(sum(_num(p.get("kcal")) for p in preds), 1),
+        "pred_names": [p.get("name") for p in preds],
+        "missed": [], "spurious": [],
+        "items": [],
+    }
+
+
 def _stats(values: list[float]) -> dict[str, Any]:
     if not values:
         return {"n": 0, "mape": None, "median": None, "p90": None}
@@ -529,6 +602,7 @@ def aggregate(scored: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "photos": len(scored),
+        "total_only_photos": sum(1 for s in scored if s.get("total_only")),
         "name": {
             "tp": tp,
             "exact": exact,
@@ -798,6 +872,12 @@ def render(result: dict[str, Any]) -> None:
         print("!! --dry-run: mock 응답이므로 아래 지표는 무의미하다 (파이프라인 점검용)")
     print(f"평가셋 {m['photos']}장 · prompt={result['prompt']} · model={result['model']}")
     print("=" * 64)
+
+    if m.get("total_only_photos"):
+        print(
+            f"  (이 중 {m['total_only_photos']}장은 total_only — 항목별 정답이 없어 "
+            "합계 kcal 지표에만 기여한다)"
+        )
 
     n = m["name"]
     print("\n[음식명 검출]")
