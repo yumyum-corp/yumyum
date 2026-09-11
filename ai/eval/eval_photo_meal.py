@@ -619,6 +619,38 @@ def aggregate(scored: list[dict[str, Any]]) -> dict[str, Any]:
             [s["total_kcal_ape"] for s in scored if s["total_kcal_ape"] is not None]
         ),
         "mfds": {arm: _arm_stats(scored, arm) for arm in _ARMS},
+        "paired": {
+            f"{arm}_{rule}": _paired(scored, arm, rule)
+            for arm in _ARMS
+            for rule in _RULES
+        },
+    }
+
+
+def _paired(scored: list[dict[str, Any]], arm: str, rule: str) -> dict[str, Any]:
+    """Option A와 B **둘 다 값이 있는 항목만**으로 두 방식을 비교한다.
+
+    arm별 전체 평균끼리 비교하면 표본이 어긋난다 — MFDS 조회에 실패한 항목이
+    A에서만 빠지기 때문이다. 그 항목들이 Vision이 유독 잘(또는 못) 맞힌
+    것이면 비교가 통째로 편향된다. 같은 항목 위에서만 견줘야 결론이 선다.
+    """
+    key = f"mfds_{arm}_{rule}_ape"
+    b_vals, a_vals = [], []
+    for s in scored:
+        for d in s["items"]:
+            b, a = d.get("kcal_ape"), d.get(key)
+            if b is not None and a is not None:
+                b_vals.append(b)
+                a_vals.append(a)
+    return {
+        "n": len(b_vals),
+        "option_b": _stats(b_vals),
+        "option_a": _stats(a_vals),
+        "a_minus_b": (
+            round(statistics.fmean(a_vals) - statistics.fmean(b_vals), 2)
+            if b_vals
+            else None
+        ),
     }
 
 
@@ -749,8 +781,9 @@ def interpret(result: dict[str, Any]) -> list[str]:
         )
     if unlabeled:
         out.append(
-            f"kcal_source가 비어 있는 항목이 {unlabeled}개다. 순환 여부를 판별할 수 없으니 "
-            "라벨을 채워라."
+            f"kcal_source가 비어 있는 항목이 {unlabeled}개다. kcal 정답을 일부러 "
+            "비운 항목(포장 표기가 없는 농산물 등)이면 정상이고 그램 지표에만 "
+            "기여한다. kcal은 있는데 출처만 빠진 경우라면 채워야 한다."
         )
 
     if g is None or dm is None:
@@ -784,8 +817,18 @@ def interpret(result: dict[str, Any]) -> list[str]:
 
     # ② Option A vs Option B 정면 비교 (그램 추정을 공유하므로 차이는 계수뿐)
     arm = m["mfds"]["pred"]
-    real = arm["median"]["mape"]
-    best = arm["oracle"]["mape"]
+    pr_real = m["paired"]["pred_median"]
+    pr_best = m["paired"]["pred_oracle"]
+    real = pr_real["option_a"]["mape"]
+    best = pr_best["option_a"]["mape"]
+    # 짝지은 부분집합에서의 Option B. 전체 평균(ik)과 다를 수 있다.
+    ik = pr_real["option_b"]["mape"] if pr_real["n"] else ik
+
+    if pr_real["n"] and pr_real["n"] < 8:
+        out.append(
+            f"짝지은 비교의 표본이 {pr_real['n']}개뿐이다. 아래 A/B 판정은 방향만 "
+            "참고하고 결론으로 쓰지 마라 — 항목 하나가 MAPE를 크게 흔든다."
+        )
 
     if real is None:
         out.append(
@@ -934,6 +977,27 @@ def render(result: dict[str, Any]) -> None:
             f"{cand:>7} {sp:>7} {st[rule]['n']:>4}"
         )
     print("  * 네 행 모두 Vision의 그램 추정을 공유한다 — 차이는 계수에서만 나온다.")
+    print("  * 위 표는 arm마다 표본이 다르다. 판정은 아래 짝지은 비교로 한다.")
+
+    print("\n[짝지은 비교 — A와 B 둘 다 값이 있는 항목만]")
+    print(
+        f"  {_pad('조합', 26)} {_pad('n', 4, True)} {_pad('B(Vision)', 10, True)} "
+        f"{_pad('A(MFDS)', 10, True)} {_pad('A-B', 8, True)}"
+    )
+    for arm, rule, label in (
+        ("pred", "median", "감지명 → 중앙값 (현실)"),
+        ("pred", "oracle", "감지명 → 오라클 (상한)"),
+        ("oracle", "median", "정답명 → 중앙값"),
+        ("oracle", "oracle", "정답명 → 오라클"),
+    ):
+        pr = m["paired"][f"{arm}_{rule}"]
+        diff = pr["a_minus_b"]
+        mark = "" if diff is None else ("  A 우세" if diff < 0 else "  B 우세")
+        print(
+            f"  {_pad(label, 26)} {pr['n']:>4} "
+            f"{_fmt(pr['option_b']['mape']):>10} {_fmt(pr['option_a']['mape']):>10} "
+            f"{_fmt(diff):>8}{mark}"
+        )
     print("  * 오라클 = 정확일치 후보 중 정답 kcal에 가장 가까운 레코드 (달성 불가능한 상한).")
 
     if result.get("by_kcal_source"):
@@ -1103,10 +1167,33 @@ def main() -> None:
     p.add_argument("--dry-run", action="store_true", help="ENV=dev, mock 응답 - 지표는 무의미")
     p.add_argument("--yes-real-api", action="store_true", help="실제 API 호출 동의 (비용 발생)")
     p.add_argument("--compare", type=Path, nargs="+", help="저장된 결과 JSON들을 비교만 한다")
+    p.add_argument(
+        "--rescore",
+        type=Path,
+        help="저장된 결과 JSON의 항목 기록으로 지표를 다시 계산한다 (API 재호출 없음)",
+    )
     args = p.parse_args()
 
     if args.compare:
         compare(args.compare)
+        return
+
+    if args.rescore:
+        old = json.loads(args.rescore.read_text(encoding="utf-8"))
+        scored = old["samples"]
+        result = {
+            **old,
+            "metrics": aggregate(scored),
+            "by_kind": by_kind(scored),
+            "by_kcal_source": by_kcal_source(scored),
+        }
+        render(result)
+        if args.out:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(
+                json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print(f"재계산 결과 저장: {args.out}\n")
         return
 
     if not args.dataset:
