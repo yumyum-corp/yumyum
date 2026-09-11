@@ -322,7 +322,18 @@ def density(kcal: float | None, grams: float | None) -> float | None:
 # 같은 음식명을 여러 사진에서 다시 묻지 않는다. 공공 API라 무료지만 느리다.
 _MFDS_CACHE: dict[str, dict[str, Any]] = {}
 
-_ARMS = ("pred", "oracle")
+# arm = (조회에 쓸 이름, 매칭 정책)
+#   이름   pred   : Vision이 감지한 이름 — Option A의 충실한 재현
+#          gt     : 정답 이름 — 이름을 완벽히 맞혔을 때의 상한
+#   정책   exact  : 정규화 후 이름이 정확히 같은 레코드만
+#          loose  : 한쪽이 다른 쪽을 포함하면 인정 (느슨한 구현을 가정)
+_ARM_SPEC: dict[str, tuple[str, str]] = {
+    "pred": ("pred", "exact"),
+    "pred_loose": ("pred", "loose"),
+    "oracle": ("gt", "exact"),
+    "oracle_loose": ("gt", "loose"),
+}
+_ARMS = tuple(_ARM_SPEC)
 _RULES = ("median", "oracle")
 
 _MFDS_PAGE_SIZE = 100
@@ -355,8 +366,16 @@ def search_term(name: str) -> str:
     return " ".join("".join(out).split())
 
 
-async def mfds_lookup(query: str) -> dict[str, Any]:
-    """음식명으로 MFDS를 조회해 **정확 일치** 레코드들의 밀도(kcal/g)를 모은다.
+async def mfds_lookup(query: str, policy: str = "exact") -> dict[str, Any]:
+    """음식명으로 MFDS를 조회해 레코드들의 밀도(kcal/g)를 모은다.
+
+    `policy="exact"`는 정규화 후 이름이 정확히 같은 것만 받는다.
+    `policy="loose"`는 포함관계까지 받는다 — 실제 구현이 "정확일치가 없으면
+    비슷한 걸로라도 쓴다"고 할 때를 가정한 대조군이다. 느슨하게 하면
+    조회 실패는 줄지만 엉뚱한 음식을 집는다: "삶은 달걀"이
+    "삶은 달걀이 통째로 들어있는 쫄면"(228 kcal/100g)에, "스팸"이
+    "CJ 바삭팝콘 스팸맛"(564)에, "참치"가 "김치찌개 참치"(51)에 붙는다.
+    두 정책을 다 재야 "더 느슨하게 하면 되지 않나"라는 반론에 답할 수 있다.
 
     부분 일치는 쓰지 않는다. MFDS 부분검색은 관련도순이 아니라서 "닭가슴살"의
     첫 결과가 "샌드위치_닭가슴살"(240 kcal/100g)이다. 틀린 음식의 계수를
@@ -367,11 +386,18 @@ async def mfds_lookup(query: str) -> dict[str, Any]:
     함께 남긴다.
     """
     key = normalize(query)
-    if not key:
+    if not key or (policy == "loose" and len(key) < 2):
         return {"densities": [], "names": []}
-    if key in _MFDS_CACHE:
-        return _MFDS_CACHE[key]
+    cache_key = f"{policy}:{key}"
+    if cache_key in _MFDS_CACHE:
+        return _MFDS_CACHE[cache_key]
     term = search_term(query) or query
+
+    def accepts(cand: str) -> bool:
+        n = normalize(cand)
+        if policy == "exact":
+            return n == key
+        return bool(n) and (key in n or n in key)
 
     densities: list[float] = []
     names: list[str] = []
@@ -388,7 +414,7 @@ async def mfds_lookup(query: str) -> dict[str, Any]:
 
         found_here = False
         for it in items:
-            if normalize(it.name) != key:
+            if not accepts(it.name):
                 continue
             d = density(it.kcal, it.serving_size_g)
             if d:
@@ -403,7 +429,7 @@ async def mfds_lookup(query: str) -> dict[str, Any]:
             break
 
     out = {"densities": densities, "names": names}
-    _MFDS_CACHE[key] = out
+    _MFDS_CACHE[cache_key] = out
     return out
 
 
@@ -427,10 +453,10 @@ async def add_mfds_arm(scored: list[dict[str, Any]]) -> None:
         for d in sc["items"]:
             pg = _num(d.get("pred_grams"))
             gt_kcal = d.get("gt_kcal")
-            queries = {"pred": d.get("pred_name"), "oracle": d.get("gt_name")}
+            queries = {"pred": d.get("pred_name"), "gt": d.get("gt_name")}
 
-            for arm in _ARMS:
-                hit = await mfds_lookup(str(queries[arm] or ""))
+            for arm, (src, policy) in _ARM_SPEC.items():
+                hit = await mfds_lookup(str(queries[src] or ""), policy)
                 ds = hit["densities"]
                 d[f"mfds_{arm}_n"] = len(ds)
                 d[f"mfds_{arm}_names"] = hit["names"][:3]
@@ -917,6 +943,27 @@ def interpret(result: dict[str, Any]) -> list[str]:
             )
         out.append(line)
 
+    # 매칭 정책을 느슨하게 하면 나아지는가 — "더 느슨하게 하면 되지 않나"에 대한 답
+    loose = m["paired"]["pred_loose_median"]
+    tight = m["paired"]["pred_median"]
+    lm, tm = loose["option_a"]["mape"], tight["option_a"]["mape"]
+    lmiss = m["mfds"]["pred_loose"]["miss_rate"]
+    tmiss = m["mfds"]["pred"]["miss_rate"]
+    if lm is not None and tm is not None and lmiss is not None and tmiss is not None:
+        if lm > tm:
+            out.append(
+                f"매칭을 포함관계까지 느슨하게 하면 조회 실패는 {tmiss:.0%}에서 "
+                f"{lmiss:.0%}로 줄지만 오차가 {tm}%에서 {lm}%로 커진다 — 엉뚱한 "
+                "음식을 집기 때문이다. 엄격하면 못 찾고 느슨하면 틀리는 양자택일이라, "
+                "매칭 정책을 바꿔서 Option A를 구제할 수는 없다."
+            )
+        else:
+            out.append(
+                f"포함관계까지 허용하면 실패가 {tmiss:.0%}→{lmiss:.0%}로 줄고 오차도 "
+                f"{tm}%→{lm}%로 준다 — 느슨한 매칭이 유리하다. Option A의 구현 "
+                "난이도를 다시 볼 근거가 된다."
+            )
+
     sp = arm["spread_median"]
     if sp is not None and sp > 1.5:
         out.append(
@@ -984,10 +1031,12 @@ def render(result: dict[str, Any]) -> None:
         f"{'-':>9} {'-':>7} {'-':>7} {b['n']:>4}"
     )
     for arm, rule, label in (
-        ("pred", "median", "A: 감지명 → 중앙값 (현실)"),
-        ("pred", "oracle", "A: 감지명 → 오라클 (상한)"),
-        ("oracle", "median", "A: 정답명 → 중앙값"),
-        ("oracle", "oracle", "A: 정답명 → 오라클"),
+        ("pred", "median", "A: 감지명·정확 → 중앙값"),
+        ("pred", "oracle", "A: 감지명·정확 → 오라클"),
+        ("pred_loose", "median", "A: 감지명·포함 → 중앙값"),
+        ("pred_loose", "oracle", "A: 감지명·포함 → 오라클"),
+        ("oracle", "median", "A: 정답명·정확 → 중앙값"),
+        ("oracle_loose", "median", "A: 정답명·포함 → 중앙값"),
     ):
         st = m["mfds"][arm]
         miss = "-" if st["miss_rate"] is None else f"{st['miss_rate']:.1%}"
@@ -998,6 +1047,7 @@ def render(result: dict[str, Any]) -> None:
             f"{cand:>7} {sp:>7} {st[rule]['n']:>4}"
         )
     print("  * 네 행 모두 Vision의 그램 추정을 공유한다 — 차이는 계수에서만 나온다.")
+    print("  * 정확 = 이름이 정규화 후 같은 레코드만 / 포함 = 한쪽이 다른 쪽을 포함해도 인정.")
     print("  * 위 표는 arm마다 표본이 다르다. 판정은 아래 짝지은 비교로 한다.")
 
     print("\n[짝지은 비교 — A와 B 둘 다 값이 있는 항목만]")
@@ -1006,10 +1056,12 @@ def render(result: dict[str, Any]) -> None:
         f"{_pad('A(MFDS)', 10, True)} {_pad('A-B', 8, True)}"
     )
     for arm, rule, label in (
-        ("pred", "median", "감지명 → 중앙값 (현실)"),
-        ("pred", "oracle", "감지명 → 오라클 (상한)"),
-        ("oracle", "median", "정답명 → 중앙값"),
-        ("oracle", "oracle", "정답명 → 오라클"),
+        ("pred", "median", "감지명·정확 → 중앙값"),
+        ("pred", "oracle", "감지명·정확 → 오라클"),
+        ("pred_loose", "median", "감지명·포함 → 중앙값"),
+        ("pred_loose", "oracle", "감지명·포함 → 오라클"),
+        ("oracle", "median", "정답명·정확 → 중앙값"),
+        ("oracle_loose", "median", "정답명·포함 → 중앙값"),
     ):
         pr = m["paired"][f"{arm}_{rule}"]
         diff = pr["a_minus_b"]
