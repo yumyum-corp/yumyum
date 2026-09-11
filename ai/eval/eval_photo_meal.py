@@ -335,6 +335,26 @@ _MFDS_MAX_PAGES = 40
 _MFDS_QUIET_PAGES = 5
 
 
+def search_term(name: str) -> str:
+    """MFDS API에 던질 검색어. 괄호와 그 안의 설명을 떼어낸다.
+
+    normalize()는 비교용이라 공백까지 지우는데, API는 자연스러운 문자열을
+    받아야 부분검색이 먹는다. Vision은 "규동(소고기덮밥)"처럼 괄호로 설명을
+    붙이는데, 그대로 던지면 그 문자열을 통째로 포함하는 레코드를 찾게 되어
+    0건이 나온다 — 괄호만 떼면 "규동"은 정확일치가 12건이다.
+    """
+    out: list[str] = []
+    depth = 0
+    for ch in name:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            out.append(ch)
+    return " ".join("".join(out).split())
+
+
 async def mfds_lookup(query: str) -> dict[str, Any]:
     """음식명으로 MFDS를 조회해 **정확 일치** 레코드들의 밀도(kcal/g)를 모은다.
 
@@ -351,6 +371,7 @@ async def mfds_lookup(query: str) -> dict[str, Any]:
         return {"densities": [], "names": []}
     if key in _MFDS_CACHE:
         return _MFDS_CACHE[key]
+    term = search_term(query) or query
 
     densities: list[float] = []
     names: list[str] = []
@@ -358,7 +379,7 @@ async def mfds_lookup(query: str) -> dict[str, Any]:
     for page in range(1, _MFDS_MAX_PAGES + 1):
         try:
             items, total = await search_food_mfds(
-                query, page=page, size=_MFDS_PAGE_SIZE
+                term, page=page, size=_MFDS_PAGE_SIZE
             )
         except Exception:  # noqa: BLE001 — 조회 실패는 미검출과 같게 센다
             break
@@ -1172,6 +1193,11 @@ def main() -> None:
         type=Path,
         help="저장된 결과 JSON의 항목 기록으로 지표를 다시 계산한다 (API 재호출 없음)",
     )
+    p.add_argument(
+        "--redo-mfds",
+        action="store_true",
+        help="--rescore와 함께. MFDS arm을 다시 조회한다 (무료, Claude 호출 없음)",
+    )
     args = p.parse_args()
 
     if args.compare:
@@ -1181,6 +1207,9 @@ def main() -> None:
     if args.rescore:
         old = json.loads(args.rescore.read_text(encoding="utf-8"))
         scored = old["samples"]
+        if args.redo_mfds:
+            print("MFDS arm 재조회 중 (Claude 호출 없음)")
+            asyncio.run(add_mfds_arm(scored))
         result = {
             **old,
             "metrics": aggregate(scored),
