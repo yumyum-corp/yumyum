@@ -9,7 +9,8 @@ logger = logging.getLogger("ai.claude")
 # 모델별 $/1M 토큰 단가 (input, output). 확인된 모델만 등록 — 없는 모델은 cost_usd=None으로 로깅.
 _PRICING_USD_PER_1M: dict[str, tuple[float, float]] = {
     "claude-haiku-4-5-20251001": (1.00, 5.00),
-    # "claude-opus-4-5-20251101": 레거시 모델, 공식 단가 확인 후 채울 것
+    # 출처: platform.claude.com/docs/en/about-claude/pricing (2026-09-11 확인)
+    "claude-opus-4-5-20251101": (5.00, 25.00),
 }
 
 
