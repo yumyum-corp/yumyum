@@ -42,6 +42,7 @@ from app.services.claude_service import (  # noqa: E402
     call_claude_vision,
     strip_json_code_block,
 )
+from app.routers.ai_meal import PHOTO_PROMPT_TEMPLATE  # noqa: E402
 from app.services.mfds_service import search_food_mfds  # noqa: E402
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -56,46 +57,31 @@ _JSON_SPEC = (
     "음식이 감지되지 않으면 detected_items를 빈 배열로 반환하세요."
 )
 
-# prod: app/routers/ai_meal.py:analyze_photo 의 사본.
-#       라우터를 바꾸면 이쪽도 같이 바꿔야 측정이 의미를 갖는다.
-_PROD = (
+# prod: 라우터에서 그대로 가져온다. 사본을 들고 있으면 언젠가 어긋나고,
+#       그러면 프로덕션이 아닌 것을 측정하게 된다.
+_PROD = PHOTO_PROMPT_TEMPLATE
+
+# prod_v1: 중복 금지 규칙을 채택하기 전의 프롬프트. 회귀 기준선으로 남긴다.
+#          이것과 prod를 비교한 결과가 채택 근거다(ADR 「결과 6」).
+_PROD_V1 = (
     "이 사진에 있는 음식을 모두 감지하고 영양소를 추정해주세요. 식사 유형: {meal_type}\n\n"
     + _JSON_SPEC
 )
 
-# hinted: 그램 추정 근거를 명시적으로 요구한다. ADR-1이 "지배적"이라 한
-#         그램 오차를 줄일 수 있는지 보는 대조군.
-_HINTED = (
-    "이 사진에 있는 음식을 모두 감지하고 영양소를 추정해주세요. 식사 유형: {meal_type}\n\n"
+# hinted: 현행 prod에 그램 추정 근거를 추가로 요구한다. ADR-1이 "지배적"이라
+#         한 그램 오차를 프롬프트로 줄일 수 있는지 보는 대조군.
+_HINTED = PHOTO_PROMPT_TEMPLATE.replace(
+    _JSON_SPEC,
     "그램 추정 시 다음을 근거로 사용하세요.\n"
     "- 함께 찍힌 식기의 표준 크기 (밥공기 지름 약 11cm·1공기 210g, 국그릇 약 15cm, "
     "일반 접시 약 23cm, 젓가락 길이 약 22cm)\n"
     "- 1인분 표준량 (공깃밥 210g, 닭가슴살 1덩이 100~150g, 계란 1개 50g)\n"
     "- 접시를 채운 넓이만 보지 말고 음식의 높이(두께)를 함께 고려하세요. "
     "넓이만 보면 과대추정됩니다.\n\n"
-    + _JSON_SPEC
+    + _JSON_SPEC,
 )
 
-# dedup: 요리 전체와 구성요소를 동시에 출력하지 말라고 제약한다.
-#        prod 대비 이 한 가지만 다르다 — 그램 힌트가 섞이면 개선이 어느
-#        쪽 덕인지 귀인할 수 없어 hinted와 따로 둔다.
-#        실측(2026-09-12) 근거: "카츠동"과 그 구성요소(돈카츠·계란·흰쌀밥·
-#        양파·홍생강·파)를 한꺼번에 내놓아 합계 kcal이 정답의 1.97배가 됐다.
-_DEDUP_RULE = (
-    "한 가지 규칙을 반드시 지키세요. 요리 전체와 그 구성 재료를 동시에 "
-    "나열하지 마세요. 덮밥·비빔밥·김밥처럼 이름이 있는 한 그릇 요리라면 "
-    "요리 이름 하나로만 보고하고, 재료를 따로 쪼개지 마세요. 반대로 반찬이 "
-    "칸칸이 담겨 각각이 독립된 음식이라면 각각을 보고하고 전체를 묶는 "
-    "이름은 넣지 마세요. 둘을 같이 내면 칼로리가 두 번 계산됩니다.\n\n"
-)
-
-_DEDUP = (
-    "이 사진에 있는 음식을 모두 감지하고 영양소를 추정해주세요. 식사 유형: {meal_type}\n\n"
-    + _DEDUP_RULE
-    + _JSON_SPEC
-)
-
-PROMPTS: dict[str, str] = {"prod": _PROD, "hinted": _HINTED, "dedup": _DEDUP}
+PROMPTS: dict[str, str] = {"prod": _PROD, "prod_v1": _PROD_V1, "hinted": _HINTED}
 
 # call_claude_vision의 기본 모델. 결과 JSON에 무엇으로 측정했는지 남기기 위해 복제한다.
 _DEFAULT_VISION_MODEL = "claude-opus-4-5-20251101"
