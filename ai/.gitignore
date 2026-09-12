@@ -6,3 +6,7 @@ venv/
 *.egg-info/
 dist/
 .pytest_cache/
+
+# 평가셋(개인 사진)과 실행 결과는 커밋하지 않는다
+eval/dataset/
+eval/results/
