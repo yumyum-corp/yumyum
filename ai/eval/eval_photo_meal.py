@@ -42,6 +42,7 @@ from app.services.claude_service import (  # noqa: E402
     call_claude_vision,
     strip_json_code_block,
 )
+from app.routers.ai_meal import PHOTO_PROMPT_TEMPLATE  # noqa: E402
 from app.services.mfds_service import search_food_mfds  # noqa: E402
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -56,27 +57,31 @@ _JSON_SPEC = (
     "음식이 감지되지 않으면 detected_items를 빈 배열로 반환하세요."
 )
 
-# prod: app/routers/ai_meal.py:analyze_photo 의 사본.
-#       라우터를 바꾸면 이쪽도 같이 바꿔야 측정이 의미를 갖는다.
-_PROD = (
+# prod: 라우터에서 그대로 가져온다. 사본을 들고 있으면 언젠가 어긋나고,
+#       그러면 프로덕션이 아닌 것을 측정하게 된다.
+_PROD = PHOTO_PROMPT_TEMPLATE
+
+# prod_v1: 중복 금지 규칙을 채택하기 전의 프롬프트. 회귀 기준선으로 남긴다.
+#          이것과 prod를 비교한 결과가 채택 근거다(ADR 「결과 6」).
+_PROD_V1 = (
     "이 사진에 있는 음식을 모두 감지하고 영양소를 추정해주세요. 식사 유형: {meal_type}\n\n"
     + _JSON_SPEC
 )
 
-# hinted: 그램 추정 근거를 명시적으로 요구한다. ADR-1이 "지배적"이라 한
-#         그램 오차를 줄일 수 있는지 보는 대조군.
-_HINTED = (
-    "이 사진에 있는 음식을 모두 감지하고 영양소를 추정해주세요. 식사 유형: {meal_type}\n\n"
+# hinted: 현행 prod에 그램 추정 근거를 추가로 요구한다. ADR-1이 "지배적"이라
+#         한 그램 오차를 프롬프트로 줄일 수 있는지 보는 대조군.
+_HINTED = PHOTO_PROMPT_TEMPLATE.replace(
+    _JSON_SPEC,
     "그램 추정 시 다음을 근거로 사용하세요.\n"
     "- 함께 찍힌 식기의 표준 크기 (밥공기 지름 약 11cm·1공기 210g, 국그릇 약 15cm, "
     "일반 접시 약 23cm, 젓가락 길이 약 22cm)\n"
     "- 1인분 표준량 (공깃밥 210g, 닭가슴살 1덩이 100~150g, 계란 1개 50g)\n"
     "- 접시를 채운 넓이만 보지 말고 음식의 높이(두께)를 함께 고려하세요. "
     "넓이만 보면 과대추정됩니다.\n\n"
-    + _JSON_SPEC
+    + _JSON_SPEC,
 )
 
-PROMPTS: dict[str, str] = {"prod": _PROD, "hinted": _HINTED}
+PROMPTS: dict[str, str] = {"prod": _PROD, "prod_v1": _PROD_V1, "hinted": _HINTED}
 
 # call_claude_vision의 기본 모델. 결과 JSON에 무엇으로 측정했는지 남기기 위해 복제한다.
 _DEFAULT_VISION_MODEL = "claude-opus-4-5-20251101"
@@ -574,9 +579,13 @@ def score_sample(sample: Sample, preds: list[dict]) -> dict[str, Any]:
                 if i not in {pi for _, pi, _ in matched}]
 
     gt_total = sample.total_kcal
-    total_ape = (
-        ape(sum(_num(p.get("kcal")) for p in preds), gt_total)
-        if gt_total is not None
+    pred_total = sum(_num(p.get("kcal")) for p in preds)
+    total_ape = ape(pred_total, gt_total) if gt_total is not None else None
+    # 부호 있는 오차. 절대값만 보면 과대와 과소가 섞여서, 요리 전체와 구성요소를
+    # 동시에 출력해 칼로리가 두 배로 잡히는 이중 계산을 식별할 수 없다.
+    bias = (
+        (pred_total - gt_total) / gt_total * 100.0
+        if gt_total not in (None, 0)
         else None
     )
 
@@ -591,9 +600,15 @@ def score_sample(sample: Sample, preds: list[dict]) -> dict[str, Any]:
         "kcal_apes": kcal_apes,
         "density_apes": density_apes,
         "total_kcal_ape": None if total_ape is None else round(total_ape, 2),
+        "total_kcal_bias": None if bias is None else round(bias, 2),
+        "gt_total_kcal": gt_total,
+        "pred_total_kcal": round(pred_total, 1),
         "missed": missed,
         "spurious": spurious,
         "items": detail,
+        # 원시 예측을 그대로 남긴다. 라벨·aliases를 고쳐도 API 재호출 없이
+        # 다시 매칭해 채점할 수 있어야 한다.
+        "preds": preds,
     }
 
 
@@ -605,9 +620,11 @@ def _score_total_only(sample: Sample, preds: list[dict]) -> dict[str, Any]:
     라벨이 거칠다는 이유로 벌주게 된다.
     """
     gt_total = sample.total_kcal
-    total_ape = (
-        ape(sum(_num(p.get("kcal")) for p in preds), gt_total)
-        if gt_total is not None
+    pred_total = sum(_num(p.get("kcal")) for p in preds)
+    total_ape = ape(pred_total, gt_total) if gt_total is not None else None
+    bias = (
+        (pred_total - gt_total) / gt_total * 100.0
+        if gt_total not in (None, 0)
         else None
     )
     return {
@@ -617,11 +634,13 @@ def _score_total_only(sample: Sample, preds: list[dict]) -> dict[str, Any]:
         "tp": 0, "exact": 0, "fp": 0, "fn": 0,
         "grams_apes": [], "kcal_apes": [], "density_apes": [],
         "total_kcal_ape": None if total_ape is None else round(total_ape, 2),
+        "total_kcal_bias": None if bias is None else round(bias, 2),
         "gt_total_kcal": gt_total,
-        "pred_total_kcal": round(sum(_num(p.get("kcal")) for p in preds), 1),
+        "pred_total_kcal": round(pred_total, 1),
         "pred_names": [p.get("name") for p in preds],
         "missed": [], "spurious": [],
         "items": [],
+        "preds": preds,
     }
 
 
@@ -665,6 +684,7 @@ def aggregate(scored: list[dict[str, Any]]) -> dict[str, Any]:
         "total_kcal": _stats(
             [s["total_kcal_ape"] for s in scored if s["total_kcal_ape"] is not None]
         ),
+        "total_kcal_bias": _bias_stats(scored),
         "mfds": {arm: _arm_stats(scored, arm) for arm in _ARMS},
         "paired": {
             f"{arm}_{rule}": _paired(scored, arm, rule)
@@ -698,6 +718,35 @@ def _paired(scored: list[dict[str, Any]], arm: str, rule: str) -> dict[str, Any]
             if b_vals
             else None
         ),
+    }
+
+
+# 예측 합계가 정답의 이 배수를 넘으면 이중 계산으로 본다. 요리 전체와
+# 구성요소를 동시에 출력하면 합계가 정확히 2배 근처로 간다.
+_DOUBLE_COUNT_BIAS = 50.0
+
+
+def _bias_stats(scored: list[dict[str, Any]]) -> dict[str, Any]:
+    """부호 있는 합계 kcal 오차. 과대추정 쏠림과 이중 계산을 잡는다."""
+    vals = [
+        s["total_kcal_bias"] for s in scored if s.get("total_kcal_bias") is not None
+    ]
+    if not vals:
+        return {"n": 0, "mean": None, "median": None, "over": 0, "suspects": []}
+    suspects = sorted(
+        (
+            (s["id"], s["kind"], s["total_kcal_bias"])
+            for s in scored
+            if (s.get("total_kcal_bias") or 0) > _DOUBLE_COUNT_BIAS
+        ),
+        key=lambda t: -t[2],
+    )
+    return {
+        "n": len(vals),
+        "mean": round(statistics.fmean(vals), 2),
+        "median": round(statistics.median(vals), 2),
+        "over": len(suspects),
+        "suspects": suspects[:10],
     }
 
 
@@ -1008,6 +1057,20 @@ def render(result: dict[str, Any]) -> None:
             f"{_fmt(s['median']):>7}  {_fmt(s['p90']):>7}"
         )
 
+    bs = m.get("total_kcal_bias") or {}
+    if bs.get("n"):
+        print(
+            f"\n[합계 kcal 편향]  평균 {bs['mean']:+.1f}%  중앙 {bs['median']:+.1f}%  "
+            f"(n={bs['n']})"
+        )
+        if bs["over"]:
+            print(
+                f"  이중 계산 의심 {bs['over']}장 (정답의 +{_DOUBLE_COUNT_BIAS:.0f}% 초과) — "
+                "요리 전체와 구성요소를 동시에 출력하면 합계가 두 배로 잡힌다"
+            )
+            for sid, kind, b in bs["suspects"]:
+                print(f"    {sid} {kind:<10} {b:+.1f}%")
+
     print("\n[kind별 분해]")
     print(
         f"  {'kind':<12} {_pad('장수', 4, True)} {_pad('명F1', 7, True)} "
@@ -1259,6 +1322,23 @@ def main() -> None:
     if args.rescore:
         old = json.loads(args.rescore.read_text(encoding="utf-8"))
         scored = old["samples"]
+
+        if args.dataset:
+            # 라벨·aliases를 고친 뒤 저장된 원시 예측으로 다시 매칭한다.
+            by_id = {sm.id: sm for sm in load_dataset(args.dataset)}
+            rematched, skipped = [], 0
+            for sc in scored:
+                sample = by_id.get(sc["id"])
+                if sample is None or "preds" not in sc:
+                    skipped += 1
+                    rematched.append(sc)
+                    continue
+                fresh = score_sample(sample, sc["preds"])
+                fresh["error"] = sc.get("error")
+                rematched.append(fresh)
+            scored = rematched
+            print(f"재매칭 {len(scored) - skipped}장" + (f" (건너뜀 {skipped}장 — 원시 예측 없음)" if skipped else ""))
+
         if args.redo_mfds:
             print("MFDS arm 재조회 중 (Claude 호출 없음)")
             asyncio.run(add_mfds_arm(scored))

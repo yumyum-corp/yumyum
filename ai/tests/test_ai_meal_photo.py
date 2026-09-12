@@ -85,3 +85,30 @@ def test_vision_호출_실패시_기술적_오류_메시지_반환(monkeypatch):
     assert data["detected_items"] == []
     assert "오류" in data["ai_comment"]
     assert "인식하지 못했" not in data["ai_comment"]
+
+
+def test_프롬프트에_중복_금지_규칙이_들어있다():
+    """요리 전체와 구성요소를 동시에 출력하면 합계 칼로리가 두 배로 잡힌다.
+
+    2026-09-12 실측에서 "카츠동"과 그 구성요소(돈카츠·계란·흰쌀밥·…)를 한꺼번에
+    내놓아 합계 kcal이 정답의 1.97배가 됐다. 앱이 항목 kcal을 합산해 사용자에게
+    총 칼로리로 보여주므로 사용자 기록이 두 배로 남는다. 이 규칙을 지우면
+    그 결함이 되돌아온다. 근거는 docs/adr/2026-06-23-vision-ai-photo-meal.md.
+    """
+    from app.routers.ai_meal import PHOTO_PROMPT_TEMPLATE
+
+    assert "동시에" in PHOTO_PROMPT_TEMPLATE
+    assert "두 번 계산" in PHOTO_PROMPT_TEMPLATE
+
+
+def test_프롬프트에_meal_type_자리가_있다():
+    """str.format을 쓰면 JSON 예시의 중괄호가 포맷 필드로 해석돼 KeyError가 난다.
+
+    라우터가 .replace로 치환하므로 자리표시자가 그대로 남아 있어야 한다.
+    """
+    from app.routers.ai_meal import PHOTO_PROMPT_TEMPLATE
+
+    assert "{meal_type}" in PHOTO_PROMPT_TEMPLATE
+    rendered = PHOTO_PROMPT_TEMPLATE.replace("{meal_type}", "LUNCH")
+    assert "{meal_type}" not in rendered
+    assert "식사 유형: LUNCH" in rendered

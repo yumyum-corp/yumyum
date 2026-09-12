@@ -130,6 +130,37 @@ async def diet_analyze(req: DietAnalyzeRequest):
     )
 
 
+# 사진 식단 분석 프롬프트. `{meal_type}` 자리만 치환해 쓴다.
+#
+# 평가 하네스(eval/eval_photo_meal.py)가 이 상수를 그대로 import한다. 예전에는
+# 하네스가 사본을 들고 있었는데, 사본은 언젠가 어긋나고 그러면 프로덕션이 아닌
+# 것을 측정하게 된다.
+#
+# str.format을 쓰면 안 된다 — JSON 예시의 중괄호를 포맷 필드로 해석해 KeyError가
+# 난다. .replace("{meal_type}", ...) 로 치환할 것.
+#
+# 중복 금지 규칙은 2026-09-12 실측으로 채택했다. 없을 때 모델이 요리 전체와
+# 구성요소를 동시에 내놓아("카츠동" + 돈카츠·계란·흰쌀밥·…) 합계 kcal이 정답의
+# 1.97배가 됐다. 앱이 항목 kcal을 합산해 총 칼로리로 보여주므로 사용자 기록이
+# 두 배로 남는 결함이다. 이 규칙 한 줄로 음식명 F1이 0.377에서 0.773으로,
+# 과검출이 49건에서 7건으로 바뀌었다. 근거는
+# docs/adr/2026-06-23-vision-ai-photo-meal.md 의 「결과 5·6」.
+PHOTO_PROMPT_TEMPLATE = (
+    "이 사진에 있는 음식을 모두 감지하고 영양소를 추정해주세요. "
+    "식사 유형: {meal_type}\n\n"
+    "한 가지 규칙을 반드시 지키세요. 요리 전체와 그 구성 재료를 동시에 "
+    "나열하지 마세요. 덮밥·비빔밥·김밥처럼 이름이 있는 한 그릇 요리라면 "
+    "요리 이름 하나로만 보고하고, 재료를 따로 쪼개지 마세요. 반대로 반찬이 "
+    "칸칸이 담겨 각각이 독립된 음식이라면 각각을 보고하고 전체를 묶는 "
+    "이름은 넣지 마세요. 둘을 같이 내면 칼로리가 두 번 계산됩니다.\n\n"
+    "아래 JSON 형식으로만 응답하세요 (다른 텍스트 없이):\n"
+    '{"detected_items": [{"name": "음식명(한국어)", "estimated_grams": 숫자, '
+    '"kcal": 숫자, "protein_g": 숫자, "carb_g": 숫자, "fat_g": 숫자}], '
+    '"ai_comment": "한 문장 한국어 코멘트"}\n\n'
+    "음식이 감지되지 않으면 detected_items를 빈 배열로 반환하세요."
+)
+
+
 @router.post("/analyze-photo", response_model=PhotoAnalyzeResponse)
 async def analyze_photo(req: PhotoAnalyzeRequest):
     """
@@ -144,14 +175,7 @@ async def analyze_photo(req: PhotoAnalyzeRequest):
     if len(req.image_base64) > _MAX_IMAGE_BASE64_CHARS:
         raise HTTPException(status_code=400, detail="이미지 크기가 너무 큽니다.")
 
-    prompt = (
-        f"이 사진에 있는 음식을 모두 감지하고 영양소를 추정해주세요. 식사 유형: {req.meal_type}\n\n"
-        "아래 JSON 형식으로만 응답하세요 (다른 텍스트 없이):\n"
-        '{"detected_items": [{"name": "음식명(한국어)", "estimated_grams": 숫자, '
-        '"kcal": 숫자, "protein_g": 숫자, "carb_g": 숫자, "fat_g": 숫자}], '
-        '"ai_comment": "한 문장 한국어 코멘트"}\n\n'
-        "음식이 감지되지 않으면 detected_items를 빈 배열로 반환하세요."
-    )
+    prompt = PHOTO_PROMPT_TEMPLATE.replace("{meal_type}", req.meal_type)
 
     try:
         raw = await call_claude_vision(
