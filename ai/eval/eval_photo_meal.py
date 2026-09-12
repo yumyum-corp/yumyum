@@ -76,7 +76,26 @@ _HINTED = (
     + _JSON_SPEC
 )
 
-PROMPTS: dict[str, str] = {"prod": _PROD, "hinted": _HINTED}
+# dedup: 요리 전체와 구성요소를 동시에 출력하지 말라고 제약한다.
+#        prod 대비 이 한 가지만 다르다 — 그램 힌트가 섞이면 개선이 어느
+#        쪽 덕인지 귀인할 수 없어 hinted와 따로 둔다.
+#        실측(2026-09-12) 근거: "카츠동"과 그 구성요소(돈카츠·계란·흰쌀밥·
+#        양파·홍생강·파)를 한꺼번에 내놓아 합계 kcal이 정답의 1.97배가 됐다.
+_DEDUP_RULE = (
+    "한 가지 규칙을 반드시 지키세요. 요리 전체와 그 구성 재료를 동시에 "
+    "나열하지 마세요. 덮밥·비빔밥·김밥처럼 이름이 있는 한 그릇 요리라면 "
+    "요리 이름 하나로만 보고하고, 재료를 따로 쪼개지 마세요. 반대로 반찬이 "
+    "칸칸이 담겨 각각이 독립된 음식이라면 각각을 보고하고 전체를 묶는 "
+    "이름은 넣지 마세요. 둘을 같이 내면 칼로리가 두 번 계산됩니다.\n\n"
+)
+
+_DEDUP = (
+    "이 사진에 있는 음식을 모두 감지하고 영양소를 추정해주세요. 식사 유형: {meal_type}\n\n"
+    + _DEDUP_RULE
+    + _JSON_SPEC
+)
+
+PROMPTS: dict[str, str] = {"prod": _PROD, "hinted": _HINTED, "dedup": _DEDUP}
 
 # call_claude_vision의 기본 모델. 결과 JSON에 무엇으로 측정했는지 남기기 위해 복제한다.
 _DEFAULT_VISION_MODEL = "claude-opus-4-5-20251101"
@@ -574,9 +593,13 @@ def score_sample(sample: Sample, preds: list[dict]) -> dict[str, Any]:
                 if i not in {pi for _, pi, _ in matched}]
 
     gt_total = sample.total_kcal
-    total_ape = (
-        ape(sum(_num(p.get("kcal")) for p in preds), gt_total)
-        if gt_total is not None
+    pred_total = sum(_num(p.get("kcal")) for p in preds)
+    total_ape = ape(pred_total, gt_total) if gt_total is not None else None
+    # 부호 있는 오차. 절대값만 보면 과대와 과소가 섞여서, 요리 전체와 구성요소를
+    # 동시에 출력해 칼로리가 두 배로 잡히는 이중 계산을 식별할 수 없다.
+    bias = (
+        (pred_total - gt_total) / gt_total * 100.0
+        if gt_total not in (None, 0)
         else None
     )
 
@@ -591,9 +614,15 @@ def score_sample(sample: Sample, preds: list[dict]) -> dict[str, Any]:
         "kcal_apes": kcal_apes,
         "density_apes": density_apes,
         "total_kcal_ape": None if total_ape is None else round(total_ape, 2),
+        "total_kcal_bias": None if bias is None else round(bias, 2),
+        "gt_total_kcal": gt_total,
+        "pred_total_kcal": round(pred_total, 1),
         "missed": missed,
         "spurious": spurious,
         "items": detail,
+        # 원시 예측을 그대로 남긴다. 라벨·aliases를 고쳐도 API 재호출 없이
+        # 다시 매칭해 채점할 수 있어야 한다.
+        "preds": preds,
     }
 
 
@@ -605,9 +634,11 @@ def _score_total_only(sample: Sample, preds: list[dict]) -> dict[str, Any]:
     라벨이 거칠다는 이유로 벌주게 된다.
     """
     gt_total = sample.total_kcal
-    total_ape = (
-        ape(sum(_num(p.get("kcal")) for p in preds), gt_total)
-        if gt_total is not None
+    pred_total = sum(_num(p.get("kcal")) for p in preds)
+    total_ape = ape(pred_total, gt_total) if gt_total is not None else None
+    bias = (
+        (pred_total - gt_total) / gt_total * 100.0
+        if gt_total not in (None, 0)
         else None
     )
     return {
@@ -617,11 +648,13 @@ def _score_total_only(sample: Sample, preds: list[dict]) -> dict[str, Any]:
         "tp": 0, "exact": 0, "fp": 0, "fn": 0,
         "grams_apes": [], "kcal_apes": [], "density_apes": [],
         "total_kcal_ape": None if total_ape is None else round(total_ape, 2),
+        "total_kcal_bias": None if bias is None else round(bias, 2),
         "gt_total_kcal": gt_total,
-        "pred_total_kcal": round(sum(_num(p.get("kcal")) for p in preds), 1),
+        "pred_total_kcal": round(pred_total, 1),
         "pred_names": [p.get("name") for p in preds],
         "missed": [], "spurious": [],
         "items": [],
+        "preds": preds,
     }
 
 
@@ -665,6 +698,7 @@ def aggregate(scored: list[dict[str, Any]]) -> dict[str, Any]:
         "total_kcal": _stats(
             [s["total_kcal_ape"] for s in scored if s["total_kcal_ape"] is not None]
         ),
+        "total_kcal_bias": _bias_stats(scored),
         "mfds": {arm: _arm_stats(scored, arm) for arm in _ARMS},
         "paired": {
             f"{arm}_{rule}": _paired(scored, arm, rule)
@@ -698,6 +732,35 @@ def _paired(scored: list[dict[str, Any]], arm: str, rule: str) -> dict[str, Any]
             if b_vals
             else None
         ),
+    }
+
+
+# 예측 합계가 정답의 이 배수를 넘으면 이중 계산으로 본다. 요리 전체와
+# 구성요소를 동시에 출력하면 합계가 정확히 2배 근처로 간다.
+_DOUBLE_COUNT_BIAS = 50.0
+
+
+def _bias_stats(scored: list[dict[str, Any]]) -> dict[str, Any]:
+    """부호 있는 합계 kcal 오차. 과대추정 쏠림과 이중 계산을 잡는다."""
+    vals = [
+        s["total_kcal_bias"] for s in scored if s.get("total_kcal_bias") is not None
+    ]
+    if not vals:
+        return {"n": 0, "mean": None, "median": None, "over": 0, "suspects": []}
+    suspects = sorted(
+        (
+            (s["id"], s["kind"], s["total_kcal_bias"])
+            for s in scored
+            if (s.get("total_kcal_bias") or 0) > _DOUBLE_COUNT_BIAS
+        ),
+        key=lambda t: -t[2],
+    )
+    return {
+        "n": len(vals),
+        "mean": round(statistics.fmean(vals), 2),
+        "median": round(statistics.median(vals), 2),
+        "over": len(suspects),
+        "suspects": suspects[:10],
     }
 
 
@@ -1008,6 +1071,20 @@ def render(result: dict[str, Any]) -> None:
             f"{_fmt(s['median']):>7}  {_fmt(s['p90']):>7}"
         )
 
+    bs = m.get("total_kcal_bias") or {}
+    if bs.get("n"):
+        print(
+            f"\n[합계 kcal 편향]  평균 {bs['mean']:+.1f}%  중앙 {bs['median']:+.1f}%  "
+            f"(n={bs['n']})"
+        )
+        if bs["over"]:
+            print(
+                f"  이중 계산 의심 {bs['over']}장 (정답의 +{_DOUBLE_COUNT_BIAS:.0f}% 초과) — "
+                "요리 전체와 구성요소를 동시에 출력하면 합계가 두 배로 잡힌다"
+            )
+            for sid, kind, b in bs["suspects"]:
+                print(f"    {sid} {kind:<10} {b:+.1f}%")
+
     print("\n[kind별 분해]")
     print(
         f"  {'kind':<12} {_pad('장수', 4, True)} {_pad('명F1', 7, True)} "
@@ -1259,6 +1336,23 @@ def main() -> None:
     if args.rescore:
         old = json.loads(args.rescore.read_text(encoding="utf-8"))
         scored = old["samples"]
+
+        if args.dataset:
+            # 라벨·aliases를 고친 뒤 저장된 원시 예측으로 다시 매칭한다.
+            by_id = {sm.id: sm for sm in load_dataset(args.dataset)}
+            rematched, skipped = [], 0
+            for sc in scored:
+                sample = by_id.get(sc["id"])
+                if sample is None or "preds" not in sc:
+                    skipped += 1
+                    rematched.append(sc)
+                    continue
+                fresh = score_sample(sample, sc["preds"])
+                fresh["error"] = sc.get("error")
+                rematched.append(fresh)
+            scored = rematched
+            print(f"재매칭 {len(scored) - skipped}장" + (f" (건너뜀 {skipped}장 — 원시 예측 없음)" if skipped else ""))
+
         if args.redo_mfds:
             print("MFDS arm 재조회 중 (Claude 호출 없음)")
             asyncio.run(add_mfds_arm(scored))
