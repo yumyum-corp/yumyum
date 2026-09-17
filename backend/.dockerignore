@@ -1,0 +1,10 @@
+.gradle
+build
+out
+.idea
+.vscode
+*.iml
+src/test
+.env
+application-local.properties
+application-local.yml
